@@ -1,0 +1,360 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+  <meta charset="UTF-8"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no"/>
+  <title>AR RFID WebXR</title>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body { background: #000; overflow: hidden; width: 100vw; height: 100vh; font-family: Arial, sans-serif; }
+
+    #overlay {
+      position: fixed;
+      top: 0; left: 0; right: 0; bottom: 0;
+      pointer-events: none;
+      z-index: 10;
+    }
+
+    #badge {
+      position: fixed;
+      top: 60px;
+      left: 50%;
+      transform: translateX(-50%);
+      font-size: 56px;
+      font-weight: 900;
+      text-shadow: 0 0 20px rgba(0,0,0,0.8);
+    }
+
+    #info-box {
+      position: fixed;
+      bottom: 120px;
+      left: 20px; right: 20px;
+      background: rgba(0,0,0,0.75);
+      border-radius: 16px;
+      padding: 16px 20px;
+    }
+
+    #asset-name {
+      color: #93C5FD;
+      font-size: 16px;
+      font-weight: bold;
+      text-align: center;
+      margin-bottom: 8px;
+    }
+
+    #epc-label {
+      color: white;
+      font-size: 12px;
+      font-family: monospace;
+      text-align: center;
+      margin-bottom: 10px;
+    }
+
+    #progress-bar-bg {
+      background: rgba(255,255,255,0.2);
+      border-radius: 8px;
+      height: 10px;
+      width: 100%;
+      overflow: hidden;
+    }
+
+    #progress-bar {
+      height: 100%;
+      border-radius: 8px;
+      transition: width 0.4s ease, background 0.4s ease;
+      width: 0%;
+    }
+
+    #zone-label {
+      color: white;
+      font-size: 12px;
+      text-align: center;
+      margin-top: 6px;
+    }
+
+    #ar-btn {
+      position: fixed;
+      bottom: 40px;
+      left: 50%;
+      transform: translateX(-50%);
+      background: #4F46E5;
+      color: white;
+      border: none;
+      padding: 16px 40px;
+      border-radius: 30px;
+      font-size: 16px;
+      font-weight: bold;
+      pointer-events: all;
+      cursor: pointer;
+      box-shadow: 0 4px 20px rgba(79,70,229,0.5);
+    }
+
+    #ar-btn:disabled {
+      background: #6B7280;
+      box-shadow: none;
+    }
+
+    #status {
+      position: fixed;
+      top: 20px;
+      left: 20px; right: 20px;
+      background: rgba(0,0,0,0.6);
+      color: white;
+      font-size: 12px;
+      padding: 8px 12px;
+      border-radius: 8px;
+      text-align: center;
+    }
+
+    #popup {
+      display: none;
+      position: fixed;
+      top: 50%; left: 50%;
+      transform: translate(-50%, -50%);
+      background: rgba(16,185,129,0.95);
+      border-radius: 20px;
+      padding: 30px 24px;
+      text-align: center;
+      z-index: 200;
+      min-width: 280px;
+      box-shadow: 0 0 40px rgba(16,185,129,0.8);
+      pointer-events: none;
+    }
+
+    @keyframes popupIn {
+      from { transform: translate(-50%, -50%) scale(0.5); opacity: 0; }
+      to   { transform: translate(-50%, -50%) scale(1); opacity: 1; }
+    }
+  </style>
+</head>
+<body>
+
+  <div id="status">Chargement ARCore...</div>
+
+  <div id="overlay">
+    <div id="badge">○</div>
+    <div id="info-box">
+      <div id="asset-name">Aucun tag ciblé</div>
+      <div id="epc-label">—</div>
+      <div id="progress-bar-bg">
+        <div id="progress-bar"></div>
+      </div>
+      <div id="zone-label">Approchez le lecteur du tag</div>
+    </div>
+  </div>
+
+  <button id="ar-btn" disabled>🔍 Démarrer AR</button>
+
+  <div id="popup">
+    <div style="font-size:60px;margin-bottom:10px;">🎯</div>
+    <div style="color:white;font-size:22px;font-weight:900;margin-bottom:8px;" id="popup-name">Tag trouvé !</div>
+    <div style="color:rgba(255,255,255,0.85);font-size:13px;font-family:monospace;" id="popup-epc"></div>
+    <div style="color:rgba(255,255,255,0.7);font-size:12px;margin-top:6px;">✅ Asset localisé avec succès</div>
+  </div>
+
+  <canvas id="canvas"></canvas>
+
+  <script type="module">
+    import * as THREE from 'https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.module.js';
+
+    // ── État RFID ──────────────────────────────────────────────────────
+    let state = {
+      targetEpc: '',
+      assetName: '',
+      zone: 'far',
+      relDist: 0,
+      heading: undefined,
+    };
+
+    // ── Éléments UI ───────────────────────────────────────────────────
+    const badge       = document.getElementById('badge');
+    const assetNameEl = document.getElementById('asset-name');
+    const epcLabel    = document.getElementById('epc-label');
+    const progressBar = document.getElementById('progress-bar');
+    const zoneLabel   = document.getElementById('zone-label');
+    const statusEl    = document.getElementById('status');
+    const arBtn       = document.getElementById('ar-btn');
+    const popup       = document.getElementById('popup');
+    const popupName   = document.getElementById('popup-name');
+    const popupEpc    = document.getElementById('popup-epc');
+
+    // ── Three.js ──────────────────────────────────────────────────────
+    const canvas   = document.getElementById('canvas');
+    const renderer = new THREE.WebGLRenderer({ canvas, alpha: true, antialias: true });
+    renderer.setPixelRatio(window.devicePixelRatio);
+    renderer.setSize(window.innerWidth, window.innerHeight);
+    renderer.xr.enabled = true;
+
+    const scene  = new THREE.Scene();
+    const camera = new THREE.PerspectiveCamera(70, window.innerWidth / window.innerHeight, 0.01, 20);
+
+    // Lumières
+    scene.add(new THREE.AmbientLight(0xffffff, 1.5));
+    const dirLight = new THREE.DirectionalLight(0xffffff, 1);
+    dirLight.position.set(1, 2, 1);
+    scene.add(dirLight);
+
+    // ── Flèche 3D ────────────────────────────────────────────────────
+    let arrowGroup = null;
+
+    function creerFleche(color) {
+      const group = new THREE.Group();
+
+      // Corps
+      const corps = new THREE.Mesh(
+        new THREE.CylinderGeometry(0.02, 0.02, 0.15, 8),
+        new THREE.MeshPhongMaterial({ color })
+      );
+      corps.position.y = -0.05;
+      group.add(corps);
+
+      // Pointe
+      const pointe = new THREE.Mesh(
+        new THREE.ConeGeometry(0.06, 0.12, 8),
+        new THREE.MeshPhongMaterial({ color })
+      );
+      pointe.position.y = 0.08;
+      group.add(pointe);
+
+      // Étiquette texte (sprite)
+      return group;
+    }
+
+    // ── Vérification WebXR AR ────────────────────────────────────────
+    async function verifierWebXR() {
+      if (!navigator.xr) {
+        statusEl.textContent = '❌ WebXR non supporté sur cet appareil';
+        return;
+      }
+      const supported = await navigator.xr.isSessionSupported('immersive-ar');
+      if (supported) {
+        statusEl.textContent = '✅ ARCore prêt !';
+        arBtn.disabled = false;
+        arBtn.textContent = '🔍 Démarrer AR';
+      } else {
+        statusEl.textContent = '❌ ARCore non disponible';
+        arBtn.disabled = true;
+      }
+    }
+
+    // ── Démarrer session AR ──────────────────────────────────────────
+    async function demarrerAR() {
+      try {
+        const session = await navigator.xr.requestSession('immersive-ar', {
+          requiredFeatures: ['hit-test'],
+          optionalFeatures: ['dom-overlay'],
+          domOverlay: { root: document.getElementById('overlay') },
+        });
+
+        renderer.xr.setReferenceSpaceType('local');
+        await renderer.xr.setSession(session);
+
+        arBtn.style.display = 'none';
+        statusEl.textContent = '🎯 AR actif — Pointez vers une surface';
+
+        // Placer la flèche devant la caméra
+        placerFleche();
+
+        renderer.setAnimationLoop((timestamp, frame) => {
+          if (frame) animer(frame);
+          renderer.render(scene, camera);
+        });
+
+        session.addEventListener('end', () => {
+          arBtn.style.display = 'block';
+          statusEl.textContent = '✅ ARCore prêt !';
+          renderer.setAnimationLoop(null);
+        });
+
+      } catch(e) {
+        statusEl.textContent = '❌ Erreur AR: ' + e.message;
+        console.error(e);
+      }
+    }
+
+    function placerFleche() {
+      if (arrowGroup) scene.remove(arrowGroup);
+      const color = state.zone === 'close' ? 0x10B981 : state.zone === 'near' ? 0xF59E0B : 0xEF4444;
+      arrowGroup = creerFleche(color);
+      arrowGroup.position.set(0, -0.2, -0.8);
+      scene.add(arrowGroup);
+    }
+
+    let angle = 0;
+    function animer(frame) {
+      angle += 0.02;
+      if (arrowGroup) {
+        const { zone } = state;
+        if (zone === 'close') {
+          arrowGroup.scale.setScalar(1 + Math.sin(angle * 8) * 0.1);
+        } else if (zone === 'near') {
+          arrowGroup.position.y = -0.2 + Math.sin(angle * 4) * 0.05;
+        } else {
+          arrowGroup.rotation.y = angle;
+        }
+      }
+    }
+
+    // ── Mise à jour UI ───────────────────────────────────────────────
+    function updateUI() {
+      const { zone, relDist, targetEpc, assetName } = state;
+      const color = zone === 'close' ? '#10B981' : zone === 'near' ? '#F59E0B' : '#EF4444';
+
+      badge.textContent = zone === 'close' ? '🎯🎯🎯' : zone === 'near' ? '🎯🎯' : '○';
+      badge.style.color = color;
+
+      progressBar.style.width      = relDist + '%';
+      progressBar.style.background = color;
+
+      epcLabel.textContent    = targetEpc || '—';
+      assetNameEl.textContent = assetName || (targetEpc ? 'Tag RFID' : 'Aucun tag ciblé');
+
+      zoneLabel.textContent = zone === 'close'
+        ? '✅ TRÈS PROCHE — vous y êtes !'
+        : zone === 'near'
+        ? '📡 DANS LA ZONE — continuez'
+        : '🔍 LOIN — tournez autour de vous';
+
+      // Popup
+      if (zone === 'close' && targetEpc) {
+        popupName.textContent     = assetName || 'Tag RFID trouvé !';
+        popupEpc.textContent      = targetEpc;
+        popup.style.display       = 'block';
+        popup.style.animation     = 'popupIn 0.4s ease forwards';
+      } else {
+        popup.style.display = 'none';
+      }
+
+      // Mettre à jour la couleur de la flèche 3D
+      if (arrowGroup) placerFleche();
+    }
+
+    // ── API React Native ─────────────────────────────────────────────
+    window.modifierInterfaceRA = function(data) {
+      try {
+        const parsed = typeof data === 'string' ? JSON.parse(data) : data;
+        state = { ...state, ...parsed };
+        updateUI();
+      } catch(e) {
+        console.error('Erreur:', e);
+      }
+    };
+
+    // ── Init ─────────────────────────────────────────────────────────
+    arBtn.addEventListener('click', demarrerAR);
+    verifierWebXR();
+    updateUI();
+
+    // Rendu de base sans AR
+    renderer.setAnimationLoop(() => {
+      renderer.render(scene, camera);
+    });
+
+    window.addEventListener('resize', () => {
+      camera.aspect = window.innerWidth / window.innerHeight;
+      camera.updateProjectionMatrix();
+      renderer.setSize(window.innerWidth, window.innerHeight);
+    });
+  </script>
+</body>
+</html>
